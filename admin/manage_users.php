@@ -9,6 +9,7 @@ if (!isset($_SESSION['user_id']) || $_SESSION['role'] !== 'admin') {
     exit;
 }
 
+// CSRF protection
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
@@ -20,7 +21,14 @@ function e($value) {
 $message = '';
 $messageType = 'success';
 
-// Handle password reset
+// Check whether optional password reset table exists
+function tableExists($conn, $tableName) {
+    $safeName = $conn->real_escape_string($tableName);
+    $result = $conn->query("SHOW TABLES LIKE '$safeName'");
+    return $result && $result->num_rows > 0;
+}
+
+// Handle all actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     $csrf = $_POST['csrf_token'] ?? '';
@@ -33,32 +41,105 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     } else {
 
+        $action = $_POST['action'] ?? '';
         $userId = filter_input(INPUT_POST, 'user_id', FILTER_VALIDATE_INT);
-        $newPassword = $_POST['new_password'] ?? '';
-        $confirmPassword = $_POST['confirm_password'] ?? '';
 
         if (!$userId || $userId <= 0) {
 
             $message = "Please select a valid user.";
             $messageType = 'error';
 
-        } elseif (strlen($newPassword) < 8) {
+        }
 
-            $message = "Password must contain at least 8 characters.";
-            $messageType = 'error';
+        /*
+        ========================================
+        ACTION 1: RESET USER PASSWORD
+        ========================================
+        */
 
-        } elseif ($newPassword !== $confirmPassword) {
+        elseif ($action === 'reset_password') {
 
-            $message = "New password and confirm password do not match.";
-            $messageType = 'error';
+            $newPassword = $_POST['new_password'] ?? '';
+            $confirmPassword = $_POST['confirm_password'] ?? '';
 
-        } else {
+            if (strlen($newPassword) < 8) {
 
-            // Only voter and candidate accounts can be reset here
+                $message = "Password must contain at least 8 characters.";
+                $messageType = 'error';
+
+            } elseif ($newPassword !== $confirmPassword) {
+
+                $message = "Passwords do not match.";
+                $messageType = 'error';
+
+            } else {
+
+                $check = $conn->prepare(
+                    "SELECT id, name, role
+                     FROM users
+                     WHERE id = ?
+                     AND role IN ('voter', 'candidate')
+                     LIMIT 1"
+                );
+
+                $check->bind_param("i", $userId);
+                $check->execute();
+                $check->bind_result($targetId, $targetName, $targetRole);
+
+                $userExists = $check->fetch();
+                $check->close();
+
+                if (!$userExists) {
+
+                    $message = "Voter or candidate account not found.";
+                    $messageType = 'error';
+
+                } else {
+
+                    $hashedPassword = password_hash(
+                        $newPassword,
+                        PASSWORD_DEFAULT
+                    );
+
+                    $update = $conn->prepare(
+                        "UPDATE users SET password = ? WHERE id = ?"
+                    );
+
+                    $update->bind_param(
+                        "si",
+                        $hashedPassword,
+                        $targetId
+                    );
+
+                    if ($update->execute()) {
+
+                        $message = "Password successfully reset for " . $targetName . ".";
+                        $messageType = 'success';
+
+                    } else {
+
+                        $message = "Unable to update password.";
+                        $messageType = 'error';
+                    }
+
+                    $update->close();
+                }
+            }
+        }
+
+        /*
+        ========================================
+        ACTION 2: PERMANENTLY DELETE USER
+        ========================================
+        */
+
+        elseif ($action === 'delete_user') {
+
+            // Admin accounts are protected
             $check = $conn->prepare(
                 "SELECT id, name, role
                  FROM users
-                 WHERE id = ? AND role IN ('voter', 'candidate')
+                 WHERE id = ?
                  LIMIT 1"
             );
 
@@ -71,40 +152,130 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             if (!$userExists) {
 
-                $message = "Selected voter or candidate account was not found.";
+                $message = "User account not found.";
+                $messageType = 'error';
+
+            } elseif ($targetRole === 'admin') {
+
+                $message = "Admin accounts cannot be deleted from this page.";
+                $messageType = 'error';
+
+            } elseif (!in_array($targetRole, ['voter', 'candidate'], true)) {
+
+                $message = "This user role cannot be deleted from this page.";
                 $messageType = 'error';
 
             } else {
 
-                $hashedPassword = password_hash(
-                    $newPassword,
-                    PASSWORD_DEFAULT
-                );
+                try {
 
-                $update = $conn->prepare(
-                    "UPDATE users SET password = ? WHERE id = ?"
-                );
+                    $conn->begin_transaction();
 
-                $update->bind_param(
-                    "si",
-                    $hashedPassword,
-                    $targetId
-                );
+                    /*
+                     * 1. Delete votes cast by this user.
+                     *
+                     * 2. Delete votes received by this user's
+                     *    candidate application(s).
+                     *
+                     * votes.candidate_id references candidates.id
+                     */
 
-                if ($update->execute() && $update->affected_rows >= 0) {
+                    $deleteVotes = $conn->prepare(
+                        "DELETE FROM votes
+                         WHERE voter_id = ?
+                         OR candidate_id IN (
+                             SELECT id
+                             FROM candidates
+                             WHERE user_id = ?
+                         )"
+                    );
 
-                    $message = "Password successfully reset for " .
-                               $targetName . " (" . $targetRole . ").";
+                    $deleteVotes->bind_param(
+                        "ii",
+                        $userId,
+                        $userId
+                    );
+
+                    if (!$deleteVotes->execute()) {
+                        throw new Exception("Unable to delete related votes.");
+                    }
+
+                    $deletedVotes = $deleteVotes->affected_rows;
+                    $deleteVotes->close();
+
+                    // 3. Delete candidate applications
+                    $deleteCandidates = $conn->prepare(
+                        "DELETE FROM candidates WHERE user_id = ?"
+                    );
+
+                    $deleteCandidates->bind_param("i", $userId);
+
+                    if (!$deleteCandidates->execute()) {
+                        throw new Exception("Unable to delete candidate applications.");
+                    }
+
+                    $deletedCandidates = $deleteCandidates->affected_rows;
+                    $deleteCandidates->close();
+
+                    // 4. Delete password reset records if the table exists
+                    if (tableExists($conn, 'password_resets')) {
+
+                        $deleteResets = $conn->prepare(
+                            "DELETE FROM password_resets WHERE user_id = ?"
+                        );
+
+                        $deleteResets->bind_param("i", $userId);
+
+                        if (!$deleteResets->execute()) {
+                            throw new Exception("Unable to delete password reset records.");
+                        }
+
+                        $deleteResets->close();
+                    }
+
+                    // 5. Delete user account
+                    $deleteUser = $conn->prepare(
+                        "DELETE FROM users
+                         WHERE id = ?
+                         AND role IN ('voter', 'candidate')"
+                    );
+
+                    $deleteUser->bind_param("i", $userId);
+
+                    if (!$deleteUser->execute() ||
+                        $deleteUser->affected_rows !== 1) {
+
+                        throw new Exception("Unable to delete user account.");
+                    }
+
+                    $deleteUser->close();
+
+                    // Commit all deletions together
+                    $conn->commit();
+
+                    $message = "User " . $targetName .
+                               " permanently deleted successfully. Related votes: " .
+                               $deletedVotes .
+                               ", candidate applications: " .
+                               $deletedCandidates . ".";
+
                     $messageType = 'success';
 
-                } else {
+                } catch (Throwable $ex) {
 
-                    $message = "Unable to update password. Please try again.";
+                    $conn->rollback();
+
+                    error_log("User deletion error: " . $ex->getMessage());
+
+                    $message = "Deletion failed. No changes were committed. Check database foreign key constraints.";
                     $messageType = 'error';
                 }
-
-                $update->close();
             }
+        }
+
+        else {
+            $message = "Invalid action.";
+            $messageType = 'error';
         }
     }
 }
@@ -128,13 +299,16 @@ if ($result) {
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
 <title>Manage Users | VotePortal</title>
 
 <style>
+
 * {
     margin: 0;
     padding: 0;
@@ -147,6 +321,8 @@ body {
     color: #292524;
     min-height: 100vh;
 }
+
+/* NAVBAR */
 
 .navbar {
     background: white;
@@ -176,9 +352,11 @@ body {
     margin-left: 20px;
 }
 
+/* CONTAINER */
+
 .container {
     width: 92%;
-    max-width: 1200px;
+    max-width: 1250px;
     margin: 45px auto;
 }
 
@@ -196,6 +374,8 @@ body {
     line-height: 1.6;
 }
 
+/* CARDS */
+
 .card {
     background: white;
     border: 1px solid #FED7AA;
@@ -210,12 +390,15 @@ body {
     margin-bottom: 20px;
 }
 
+/* MESSAGES */
+
 .message {
     padding: 14px 17px;
     border-radius: 9px;
     margin-bottom: 22px;
     font-size: 14px;
     line-height: 1.5;
+    overflow-wrap: anywhere;
 }
 
 .success {
@@ -230,14 +413,16 @@ body {
     border: 1px solid #FECDD3;
 }
 
+/* FORM */
+
+.form-group {
+    margin-bottom: 18px;
+}
+
 .form-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 18px;
-}
-
-.form-group {
-    margin-bottom: 18px;
 }
 
 label {
@@ -247,7 +432,8 @@ label {
     margin-bottom: 9px;
 }
 
-select, input {
+select,
+input {
     width: 100%;
     height: 49px;
     padding: 0 13px;
@@ -259,10 +445,13 @@ select, input {
     outline: none;
 }
 
-select:focus, input:focus {
+select:focus,
+input:focus {
     border-color: #EA580C;
     box-shadow: 0 0 0 3px #FFEDD5;
 }
+
+/* BUTTONS */
 
 .submit-btn {
     border: none;
@@ -279,6 +468,23 @@ select:focus, input:focus {
     background: #9A3412;
 }
 
+.delete-btn {
+    border: none;
+    border-radius: 7px;
+    padding: 9px 13px;
+    background: #FEE2E2;
+    color: #B91C1C;
+    font-weight: bold;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.delete-btn:hover {
+    background: #FECACA;
+}
+
+/* TABLE */
+
 .table-wrapper {
     overflow-x: auto;
 }
@@ -286,7 +492,7 @@ select:focus, input:focus {
 table {
     width: 100%;
     border-collapse: collapse;
-    min-width: 650px;
+    min-width: 850px;
 }
 
 th {
@@ -301,6 +507,7 @@ td {
     padding: 15px;
     border-bottom: 1px solid #F3E2D4;
     font-size: 14px;
+    vertical-align: middle;
 }
 
 .role {
@@ -321,7 +528,19 @@ td {
     font-size: 13px;
 }
 
+.warning {
+    background: #FFF7ED;
+    border: 1px solid #FED7AA;
+    color: #9A3412;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 20px;
+    font-size: 13px;
+    line-height: 1.6;
+}
+
 @media(max-width:700px) {
+
     .navbar {
         padding: 17px 5%;
     }
@@ -342,11 +561,16 @@ td {
     .heading h1 {
         font-size: 26px;
     }
+
 }
+
 </style>
+
 </head>
 
 <body>
+
+<!-- NAVBAR -->
 
 <header class="navbar">
 
@@ -361,18 +585,31 @@ td {
 
 </header>
 
+
 <main class="container">
 
     <div class="heading">
+
         <h1>Manage Users</h1>
-        <p>View registered voters and candidates and securely reset their passwords.</p>
+
+        <p>
+            View registered voters and candidates,
+            reset passwords and manage user accounts.
+        </p>
+
     </div>
 
+
     <?php if ($message !== ''): ?>
-        <div class="message <?= e($messageType) ?>">
+
+        <div class="message <?= e($messageType) ?>" role="alert">
             <?= e($message) ?>
         </div>
+
     <?php endif; ?>
+
+
+    <!-- RESET PASSWORD CARD -->
 
     <section class="card">
 
@@ -380,30 +617,48 @@ td {
 
         <form method="POST">
 
-            <input type="hidden" name="csrf_token"
+            <input type="hidden"
+                   name="csrf_token"
                    value="<?= e($_SESSION['csrf_token']) ?>">
 
-            <div class="form-group">
-                <label for="user_id">Select Voter / Candidate</label>
+            <input type="hidden"
+                   name="action"
+                   value="reset_password">
 
-                <select name="user_id" id="user_id" required>
+            <div class="form-group">
+
+                <label for="reset_user_id">
+                    Select Voter / Candidate
+                </label>
+
+                <select name="user_id" id="reset_user_id" required>
+
                     <option value="">-- Select User --</option>
 
                     <?php foreach ($users as $user): ?>
+
                         <option value="<?= (int)$user['id'] ?>">
+
                             <?= e($user['name']) ?>
                             (<?= e($user['email']) ?> -
                             <?= e(ucfirst($user['role'])) ?>)
+
                         </option>
+
                     <?php endforeach; ?>
 
                 </select>
+
             </div>
+
 
             <div class="form-grid">
 
                 <div class="form-group">
-                    <label for="new_password">New Password</label>
+
+                    <label for="new_password">
+                        New Password
+                    </label>
 
                     <input
                         type="password"
@@ -414,10 +669,15 @@ td {
                         autocomplete="new-password"
                         required
                     >
+
                 </div>
 
+
                 <div class="form-group">
-                    <label for="confirm_password">Confirm Password</label>
+
+                    <label for="confirm_password">
+                        Confirm Password
+                    </label>
 
                     <input
                         type="password"
@@ -428,9 +688,11 @@ td {
                         autocomplete="new-password"
                         required
                     >
+
                 </div>
 
             </div>
+
 
             <button type="submit" class="submit-btn">
                 Reset Password →
@@ -440,22 +702,42 @@ td {
 
     </section>
 
+
+    <!-- REGISTERED USERS TABLE -->
+
     <section class="card">
 
         <h2>Registered Users (<?= count($users) ?>)</h2>
 
+        <div class="warning">
+
+            <strong>Important:</strong>
+
+            Permanently deleting a user also removes their votes,
+            candidate applications and votes received by their
+            candidate application. Election results may change.
+            Admin accounts are protected.
+
+        </div>
+
+
         <div class="table-wrapper">
 
             <table>
+
                 <thead>
+
                     <tr>
                         <th>ID</th>
                         <th>Name</th>
                         <th>Email Address</th>
                         <th>Role</th>
                         <th>Registered On</th>
+                        <th>Action</th>
                     </tr>
+
                 </thead>
+
 
                 <tbody>
 
@@ -464,15 +746,59 @@ td {
                     <?php foreach ($users as $user): ?>
 
                         <tr>
-                            <td><?= (int)$user['id'] ?></td>
-                            <td><?= e($user['name']) ?></td>
-                            <td><?= e($user['email']) ?></td>
+
+                            <td>
+                                <?= (int)$user['id'] ?>
+                            </td>
+
+                            <td>
+                                <?= e($user['name']) ?>
+                            </td>
+
+                            <td>
+                                <?= e($user['email']) ?>
+                            </td>
+
                             <td>
                                 <span class="role">
                                     <?= e($user['role']) ?>
                                 </span>
                             </td>
-                            <td><?= e($user['created_at']) ?></td>
+
+                            <td>
+                                <?= e($user['created_at']) ?>
+                            </td>
+
+                            <td>
+
+                                <!-- DELETE USER FORM -->
+
+                                <form method="POST"
+                                      onsubmit="return confirmDelete(this);">
+
+                                    <input type="hidden"
+                                           name="csrf_token"
+                                           value="<?= e($_SESSION['csrf_token']) ?>">
+
+                                    <input type="hidden"
+                                           name="action"
+                                           value="delete_user">
+
+                                    <input type="hidden"
+                                           name="user_id"
+                                           value="<?= (int)$user['id'] ?>">
+
+                                    <button type="submit"
+                                            class="delete-btn">
+
+                                        Delete Permanently
+
+                                    </button>
+
+                                </form>
+
+                            </td>
+
                         </tr>
 
                     <?php endforeach; ?>
@@ -480,14 +806,17 @@ td {
                 <?php else: ?>
 
                     <tr>
-                        <td colspan="5" style="text-align:center;">
+
+                        <td colspan="6" style="text-align:center;">
                             No registered users found.
                         </td>
+
                     </tr>
 
                 <?php endif; ?>
 
                 </tbody>
+
             </table>
 
         </div>
@@ -496,9 +825,35 @@ td {
 
 </main>
 
+
 <footer class="footer">
+
     © <?= date('Y') ?> VotePortal - Admin Panel
+
 </footer>
+
+
+<script>
+
+function confirmDelete(form) {
+
+    const confirmed = confirm(
+        "WARNING!\n\n" +
+        "Are you sure you want to permanently delete this user?\n\n" +
+        "Their votes, candidate application and related vote records " +
+        "will also be deleted.\n\n" +
+        "This action cannot be undone.\n\n" +
+        "Click OK to permanently delete."
+    );
+
+    if (!confirmed) {
+        return false;
+    }
+
+    return true;
+}
+
+</script>
 
 </body>
 </html>
