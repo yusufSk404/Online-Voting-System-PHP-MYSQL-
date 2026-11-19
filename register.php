@@ -1,70 +1,136 @@
 
 <?php
+session_start();
 require_once 'config/db.php';
 
 $error = "";
 $success = "";
 
-if (isset($_POST['register'])) {
-    $name = trim($_POST['name'] ?? '');
-    $email = trim($_POST['email'] ?? '');
-    $password = $_POST['password'] ?? '';
-    $role = $_POST['role'] ?? '';
+// Generate CSRF token
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
 
-    if ($name === '' || $email === '' || $password === '') {
-        $error = "Please fill in all required fields.";
-    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $error = "Please enter a valid email address.";
-    } elseif (strlen($password) < 8) {
-        $error = "Password must contain at least 8 characters.";
-    } elseif (!in_array($role, ['voter', 'candidate', 'admin'], true)) {
-        $error = "Please select a valid account type.";
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['register'])) {
+
+    // Verify CSRF token
+    $submittedToken = $_POST['csrf_token'] ?? '';
+
+    if (
+        !is_string($submittedToken) ||
+        !hash_equals($_SESSION['csrf_token'], $submittedToken)
+    ) {
+        $error = "Invalid request. Please refresh the page and try again.";
     } else {
-        try {
-            $check = $conn->prepare(
-                "SELECT id FROM users WHERE email = ? LIMIT 1"
-            );
 
-            $check->bind_param("s", $email);
-            $check->execute();
-            $check->store_result();
+        $name = trim($_POST['name'] ?? '');
+        $email = trim($_POST['email'] ?? '');
+        $password = $_POST['password'] ?? '';
+        $role = $_POST['role'] ?? '';
 
-            if ($check->num_rows > 0) {
-                $error = "Email already registered. Please login.";
-                $check->close();
-            } else {
-                $check->close();
+        // Server-side validation
+        if ($name === '' || $email === '' || $password === '') {
+            $error = "Please fill in all required fields.";
 
-                $hashedPassword = password_hash(
-                    $password,
-                    PASSWORD_DEFAULT
+        } elseif (strlen($name) > 100) {
+            $error = "Name must not exceed 100 characters.";
+
+        } elseif (strlen($email) > 150 ||
+                  !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Please enter a valid email address.";
+
+        } elseif (!is_string($password) || strlen($password) < 8) {
+            $error = "Password must contain at least 8 characters.";
+
+        } elseif (!in_array($role, ['voter', 'candidate'], true)) {
+            $error = "Please select a valid account type.";
+
+        } else {
+
+            try {
+
+                // Check duplicate email
+                $check = $conn->prepare(
+                    "SELECT id FROM users WHERE email = ? LIMIT 1"
                 );
 
-                $stmt = $conn->prepare(
-                    "INSERT INTO users (name, email, password, role)
-                     VALUES (?, ?, ?, ?)"
-                );
-
-                $stmt->bind_param(
-                    "ssss",
-                    $name,
-                    $email,
-                    $hashedPassword,
-                    $role
-                );
-
-                if ($stmt->execute()) {
-                    $success = "Registration successful! Please login.";
-                    $_POST = [];
-                } else {
-                    $error = "Registration failed. Please try again.";
+                if (!$check) {
+                    throw new Exception("Database query preparation failed.");
                 }
 
-                $stmt->close();
+                $check->bind_param("s", $email);
+                $check->execute();
+                $check->store_result();
+
+                if ($check->num_rows > 0) {
+
+                    $error = "Email already registered. Please login.";
+                    $check->close();
+
+                } else {
+
+                    $check->close();
+
+                    // Hash password
+                    $hashedPassword = password_hash(
+                        $password,
+                        PASSWORD_DEFAULT
+                    );
+
+                    if ($hashedPassword === false) {
+                        throw new Exception("Password hashing failed.");
+                    }
+
+                    // Insert new user
+                    $stmt = $conn->prepare(
+                        "INSERT INTO users (name, email, password, role)
+                         VALUES (?, ?, ?, ?)"
+                    );
+
+                    if (!$stmt) {
+                        throw new Exception("Registration query preparation failed.");
+                    }
+
+                    $stmt->bind_param(
+                        "ssss",
+                        $name,
+                        $email,
+                        $hashedPassword,
+                        $role
+                    );
+
+                    if ($stmt->execute()) {
+
+                        $success = "Registration successful! Please login.";
+
+                        // Clear sensitive form values
+                        $_POST = [];
+
+                        // Generate a fresh CSRF token
+                        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+
+                    } else {
+                        $error = "Registration failed. Please try again.";
+                    }
+
+                    $stmt->close();
+                }
+
+            } catch (mysqli_sql_exception $ex) {
+
+                // Handle duplicate email race condition
+                if ($ex->getCode() === 1062) {
+                    $error = "Email already registered. Please login.";
+                } else {
+                    error_log("VotePortal registration error: " . $ex->getMessage());
+                    $error = "Unable to create your account. Please try again.";
+                }
+
+            } catch (Exception $ex) {
+
+                error_log("VotePortal registration error: " . $ex->getMessage());
+                $error = "Unable to create your account. Please try again.";
             }
-        } catch (mysqli_sql_exception $ex) {
-            error_log("VotePortal registration error: " . $ex->getMessage());
-            $error = "Unable to create your account. Please try again.";
         }
     }
 }
@@ -72,12 +138,16 @@ if (isset($_POST['register'])) {
 
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
 <title>Register | VotePortal</title>
 
 <style>
+
 * {
     margin: 0;
     padding: 0;
@@ -291,6 +361,7 @@ input:focus, select:focus {
 }
 
 @media (max-width: 750px) {
+
     .navbar {
         padding: 18px 5%;
     }
@@ -313,21 +384,32 @@ input:focus, select:focus {
     .form-card {
         padding: 25px 20px;
     }
+
 }
+
 </style>
+
 </head>
 
 <body>
 
 <header class="navbar">
-    <div class="logo">Vote<span>Portal</span></div>
+
+    <div class="logo">
+        Vote<span>Portal</span>
+    </div>
+
     <a href="login.php">Login →</a>
+
 </header>
 
 <main class="main">
 
     <section class="welcome">
-        <div class="tag">YOUR VOICE MATTERS</div>
+
+        <div class="tag">
+            YOUR VOICE MATTERS
+        </div>
 
         <h1>
             Every vote counts.<br>
@@ -340,6 +422,7 @@ input:focus, select:focus {
         </p>
 
         <div class="features">
+
             <div class="feature">
                 <div class="feature-icon">✓</div>
                 Secure account registration
@@ -354,28 +437,46 @@ input:focus, select:focus {
                 <div class="feature-icon">▣</div>
                 One vote per election
             </div>
+
         </div>
+
     </section>
 
     <section class="form-card">
+
         <h2>Create Account</h2>
-        <p class="subtitle">Fill in your details to get started.</p>
+
+        <p class="subtitle">
+            Fill in your details to get started.
+        </p>
 
         <?php if ($error !== ''): ?>
+
             <div class="message error">
                 <?= htmlspecialchars($error, ENT_QUOTES, 'UTF-8') ?>
             </div>
+
         <?php endif; ?>
 
         <?php if ($success !== ''): ?>
+
             <div class="message success">
                 <?= htmlspecialchars($success, ENT_QUOTES, 'UTF-8') ?>
                 <a href="login.php">Login here</a>
             </div>
+
         <?php endif; ?>
 
         <form method="POST" action="">
+
+            <input
+                type="hidden"
+                name="csrf_token"
+                value="<?= htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES, 'UTF-8') ?>"
+            >
+
             <label for="name">Full Name</label>
+
             <input
                 type="text"
                 id="name"
@@ -387,6 +488,7 @@ input:focus, select:focus {
             >
 
             <label for="email">Email Address</label>
+
             <input
                 type="email"
                 id="email"
@@ -398,6 +500,7 @@ input:focus, select:focus {
             >
 
             <label for="password">Password</label>
+
             <input
                 type="password"
                 id="password"
@@ -408,22 +511,36 @@ input:focus, select:focus {
             >
 
             <label for="role">Register As</label>
+
             <select id="role" name="role" required>
-                <option value="" disabled selected>Select account type</option>
-                <option value="voter">Voter</option>
-                <option value="candidate">Candidate</option>
-                <option value="admin">Admin</option>
+
+                <option value="" disabled selected>
+                    Select account type
+                </option>
+
+                <option value="voter"
+                    <?= (($_POST['role'] ?? '') === 'voter') ? 'selected' : '' ?>>
+                    Voter
+                </option>
+
+                <option value="candidate"
+                    <?= (($_POST['role'] ?? '') === 'candidate') ? 'selected' : '' ?>>
+                    Candidate
+                </option>
+
             </select>
 
             <button type="submit" name="register" class="submit-btn">
                 Create My Account →
             </button>
+
         </form>
 
         <p class="login-text">
             Already registered?
             <a href="login.php">Login here</a>
         </p>
+
     </section>
 
 </main>
