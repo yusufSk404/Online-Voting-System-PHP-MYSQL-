@@ -1,4 +1,3 @@
-
 <?php
 session_start();
 require_once '../config/db.php';
@@ -112,6 +111,29 @@ if ($stmt) {
 
         while ($row = $res->fetch_assoc()) {
             $elections[] = $row;
+        }
+    }
+
+    $stmt->close();
+}
+
+/* Upcoming Elections */
+$upcomingElections = [];
+
+$sql = "SELECT *
+        FROM elections
+        WHERE status = 'upcoming'
+          AND start_date > NOW()
+        ORDER BY start_date ASC";
+
+$stmt = $conn->prepare($sql);
+
+if ($stmt) {
+    if ($stmt->execute()) {
+        $res = $stmt->get_result();
+
+        while ($row = $res->fetch_assoc()) {
+            $upcomingElections[] = $row;
         }
     }
 
@@ -491,6 +513,11 @@ a {
     background: var(--green-bg);
 }
 
+.status.upcoming {
+    color: #1D4ED8;
+    background: #DBEAFE;
+}
+
 .election-card h3 {
     font-size: 21px;
     margin-bottom: 10px;
@@ -829,6 +856,7 @@ a {
 
     <nav class="nav-links">
         <a href="#elections">Active Elections</a>
+        <a href="#upcoming">Upcoming Elections</a>
         <a href="#results">Election Results</a>
         <a href="#history">Voting History</a>
         <a href="../logout.php" class="logout">Logout</a>
@@ -954,6 +982,92 @@ a {
                 </p>
             </div>
         <?php endif; ?>
+    </section>
+
+    <!-- Upcoming Elections -->
+    <section class="section" id="upcoming">
+
+        <div class="section-heading">
+            <div>
+                <h2>Upcoming Elections</h2>
+                <p>Explore elections that are scheduled to start soon.</p>
+            </div>
+        </div>
+
+        <?php if (count($upcomingElections) > 0): ?>
+
+            <div class="election-grid">
+
+                <?php foreach ($upcomingElections as $upcoming): ?>
+
+                    <article class="election-card">
+
+                        <span class="status upcoming">
+                            ● Upcoming Election
+                        </span>
+
+                        <h3><?= h($upcoming['title']) ?></h3>
+
+                        <p>
+                            <?= h(
+                                $upcoming['description']
+                                ?: 'Get ready to participate in this upcoming election.'
+                            ) ?>
+                        </p>
+
+                        <div class="election-meta">
+
+                            <div>
+                                <div class="meta-label">Category</div>
+                                <div class="meta-value">
+                                    <?= h($upcoming['category'] ?: 'General') ?>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="meta-label">Voting Starts</div>
+                                <div class="meta-value">
+                                    <?= h(formatDate($upcoming['start_date'])) ?>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="meta-label">Voting Ends</div>
+                                <div class="meta-value">
+                                    <?= h(formatDate($upcoming['end_date'])) ?>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="meta-label">Status</div>
+                                <div class="meta-value">Not Started</div>
+                            </div>
+
+                        </div>
+
+                        <span class="btn-disabled">
+                            Voting Not Started Yet
+                        </span>
+
+                    </article>
+
+                <?php endforeach; ?>
+
+            </div>
+
+        <?php else: ?>
+
+            <div class="empty">
+                <div class="empty-icon">📅</div>
+                <h3>No Upcoming Elections</h3>
+                <p>
+                    There are no scheduled elections at the moment.
+                    Please check again later.
+                </p>
+            </div>
+
+        <?php endif; ?>
+
     </section>
 
     <!-- Election Results -->
@@ -1189,6 +1303,14 @@ a {
                 <div>
                     <strong>Browse Elections</strong>
                     <span>Explore active elections and available candidates.</span>
+                </div>
+            </a>
+
+            <a href="#upcoming" class="quick-card">
+                <div class="quick-icon">📅</div>
+                <div>
+                    <strong>Upcoming Elections</strong>
+                    <span>View future elections and their scheduled dates.</span>
                 </div>
             </a>
 
